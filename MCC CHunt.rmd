@@ -1,0 +1,350 @@
+---
+title: "R Notebook"
+output:
+  word_document: default
+  html_notebook: default
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(magrittr)
+library(tidyverse)
+library(DescTools)
+library(readxl)
+library(ggthemes)
+```
+
+## Data
+
+```{r}
+x <- read.csv("C:/Users/DaStophe/Desktop/Data_File_Transfer_Usnish/Data_File_Transfer_Usnish/df_table1.csv")
+df_cc <- read.csv("C:/Users/DaStophe/Desktop/Data_File_Transfer_Usnish/Data_File_Transfer_Usnish/data/merged_cost_conditions.csv")
+condition <- read_xls("C:/Users/DaStophe/Desktop/Data_File_Transfer_Usnish/Data_File_Transfer_Usnish/data/disease_dictionary.xls") %>% 
+  rename( "condition_code" = "X__1") %>%
+  mutate(condition_code = as.character(condition_code))
+```
+
+```{r}
+length(unique(df_cc$member_no))
+```
+
+
+## Data Transformation
+
+This chunk takes the the data and creates the necessary transformations for table 1
+
+```{r}
+cols <- max(str_count(df_cc$classes,",")) + 1
+cols <- paste0("col",c(1:cols))
+
+tab_1 <- df_cc %>% 
+           mutate(age_group = case_when(age <= 18 ~ '0-18',
+                                        age > 18 & age <= 35 ~ '18-35',
+                                        age > 35 & age <= 50 ~ '35-50',
+                                        age > 50 & age <= 65 ~ '50-65',
+                                        age > 65 ~ '65+',
+                                        TRUE ~ 'Not provided'),
+                  chronic_condition = case_when(no_comorbidities >= 5 ~ "5+ Chronic Condition(s)",
+                                               TRUE ~ paste(as.character(no_comorbidities), 
+                                                                        "Chronic Condition(s)")),
+                  classes = gsub("[[:punct:]]", "", classes) ) %>%
+              unite("chronic_condition_yr", c("chronic_condition","year"), sep = " yr:") %>%
+              filter(age_group != 'Not provided' & sex != 'Not provided') %>%# & year == 2014) %>%
+              mutate(winsorized_sum_cost = Winsorize(sum_costs, probs = c(.05, .95))) %>%
+              separate(classes, into = cols, sep = " ", remove = FALSE)
+
+top_conditions <- tab_1 %>% 
+                  select(member_no, contains("col")) %>%
+                  gather(column_number, condition, cols[1]:cols[length(cols)]) %>%
+                  select(member_no, condition) %>%
+                  group_by(condition) %>%
+                  summarise(count = n()) %>%
+                  filter(!is.na(condition) & condition != "NULL") %>%
+                  arrange(-count) %>%
+                  top_n(10) 
+
+patient <- tab_1 %>% 
+            select(member_no, chronic_condition_yr, contains("col")) %>%
+            group_by(member_no, chronic_condition_yr) %>%
+            gather(column_number,  condition, col1:col37) %>%
+            select(member_no, chronic_condition_yr, condition) %>%
+            mutate(top_condition = case_when(condition %in% 
+                                               top_conditions$condition ~ "top condition",
+                                               TRUE ~ as.character(NA))) %>%
+            filter(!is.na(top_condition)) %>%
+            left_join(condition, by = c("condition" = "condition_code" )) %>%
+            select(member_no, short, condition) %>%
+            spread(short, condition) %>%
+            mutate_if(is.character, funs(ifelse(is.na(.), "No", "Yes"))) 
+
+patient <- patient[ifelse(names(patient) == "<NA>", FALSE, TRUE)] ##TODO - remove hardcoding
+
+tab_1 <- tab_1 %>% left_join(patient, by = "member_no") 
+tab_1
+```
+
+### Table 1
+
+```{r}
+#Load package
+library(tableone)
+library(knitr)
+
+conditions <- names(tab_1[,(ncol(tab_1)-9):ncol(tab_1)]) ##TODO - remove hardcoding 
+
+#all variables to be considered
+listVars <- c("age", "sex",  "sum_costs", "winsorized_sum_cost", conditions)
+
+#categorical variables
+catVars <- c("sex", conditions)
+
+table1 <- CreateTableOne(vars = listVars, 
+                         data = tab_1,
+                         factorVars = catVars, 
+                         strata = c("chronic_condition_yr.x")) 
+table1
+
+add_comma <- function(pt1) {
+  require(stringr)
+  pt1_out <- pt1
+  for(i in 1:ncol(pt1)) {
+    cur_column <- pt1[, i]
+    num_after <- str_extract(cur_column, '[0-9.]+\\b') %>% as.numeric %>% comma %>% str_replace('(\\.00|NA)', '') %>% trimws
+    pt1_out[, i] <- str_replace(string=pt1_out[, i], pattern='[0-9.]+\\b', replacement=num_after)
+  }
+  return(pt1_out)
+}
+
+## Format table 1 output
+tab_1_out <- print(table1,  quote = FALSE, noSpaces = TRUE, printToggle = FALSE)  %>% add_comma()
+## Save to a CSV file
+write.csv(tab_1_out, file = paste0("myTable", Sys.Date(), ".csv"))
+
+table1
+```
+
+## Plotting patient counts and regression coefficient
+
+```{r}
+#
+# Regression analysis for comorbidities study
+#
+library(stargazer)
+library(MASS)
+library(arm)
+library(foreign)
+library(plm)
+library(magrittr)
+
+##################################################
+# LOAD AND CLEAN DATA
+##################################################
+data <- read.csv('Data_File_Transfer_Usnish/Data_File_Transfer_Usnish/data/regression_data.csv')
+cost_data <- read.csv('Data_File_Transfer_Usnish/Data_File_Transfer_Usnish/data/cost_estimation.csv')
+data <- merge(data, cost_data, by.x=c("member_no", "year"), by.y=c("membno", "year"))
+
+data$zipcode[data$zipcode==''] <- NA
+data$zipcode[data$zipcode=='<NA>'] <- NA
+data$zipcode[data$zipcode=='NA'] <- NA
+data$zipcode <- factor(data$zipcode)
+
+data$sex[data$sex==''] <- NA
+data$sex[data$sex=='<NA>'] <- NA
+data$sex[data$sex=='NA'] <- NA
+data$sex <- factor(data$sex)
+
+data %<>% filter(!is.na(sex)) 
+
+
+# make the number of comorbidities a factor
+no_comorbidities.f <- factor(data$no_comorbidities)
+data <- cbind(no_comorbidities.f, data)
+
+##  make dummy variables factors
+for (column in colnames(data)[c(c(14:83), c(87:131))]) {
+    data[column] <- factor(data[[column]])
+}
+
+# make panel data
+panel_data <- data[data$count>1,]
+```
+
+```{r}
+####################################################
+# CREATE FORMULAS
+####################################################
+formula.base.factor <- as.formula('sum_costs ~ no_comorbidities.f')
+
+###################################################
+# MODELLING
+###################################################
+
+# factor model :: there's a nice plot out of this one
+model.base.factor <- lm(formula.base.factor, data=data)
+```
+
+```{r, results='asis'}
+library(coefplot)
+coef <- model.base.factor$coefficients
+results <- c(round(coef[1],0), round(coef[2:length(coef)] + coef[1],0)) %>% as.data.frame() %>% rownames_to_column()
+coef_df <- results %>% rename("no_comorbid" = "rowname", "results" = ".") %>% 
+  mutate(no_comorbid = as.numeric(gsub( "no_comorbidities.f", "", gsub("\\(Intercept\\)", "0", no_comorbid))),
+         results = results) %>%
+  arrange(no_comorbid)
+```
+
+```{r}
+plot_df <- data %>%  
+             group_by(no_comorbidities,year) %>%
+             summarise(total_patient_counts = sum(!is.na(member_no))) %>%
+            group_by(no_comorbidities) %>%
+            summarise(patient_counts = round(mean(total_patient_counts),0))
+
+
+library(ggplot2)
+library(ggthemes)
+library(scales)
+
+
+patient_counts <- ggplot(plot_df, aes(no_comorbidities , patient_counts))+
+                    geom_rangeframe() +
+                    geom_bar(stat = "identity") +
+                    theme_gdocs() + 
+                    scale_y_continuous(labels = comma) +
+                    xlab("Number of Comorbidities") +
+                    ylab("Mean Yearly Patient Counts") +
+                    scale_x_continuous(breaks = c(seq(0, 35, by = 5))) +
+                    ggtitle("")
+
+
+
+coef_plot <- ggplot(coef_df %>% filter(no_comorbid<= 20), aes(no_comorbid, 
+                                 results))+
+                    geom_rangeframe() +
+                    geom_bar(stat = "identity") +
+                    theme_gdocs() + 
+                    scale_y_continuous(labels = dollar) +
+                    xlab("Number of Comorbidities") +
+                    ylab("Regression Estimate of Annual Spending ") +
+                    ggtitle("")
+```
+
+### Saving formatted plots to disk
+
+```{r}
+library(cowplot)
+plot2 <- plot_grid(patient_counts, coef_plot, ncol=2, align = "v", nrow = 1, labels=c("A", "B"))
+save_plot("plot2.png", plot2, ncol = 2, nrow = 1, base_aspect_ratio = 1.3 )
+```
+
+### Table
+
+age, sex, chronic conditions, average cost
+
+```{r}
+library(readxl)
+top_clusters <- read_xlsx("./Clusters by frequency and cost.xlsx")
+```
+
+
+```{r}
+top_cc_plot_df <- top_clusters %>% 
+                    unite("Conditions", 
+                         `Chronic Condition 1`, 
+                         `Chronic Condition 2`, sep = " + \n ")
+
+top_cc_plot_df$Conditions_abr <- abbreviate(top_cc_plot_df$Conditions)
+
+#freq_plot <- 
+  ggplot(top_cc_plot_df %>% filter(Type == "By Frequency"), 
+                     aes(y = `Average Yearly Cost`, 
+                         x = `Number of Person-years`,
+                         #x = reorder(Conditions, -`Average Yearly Cost`) , 
+                         color = Conditions_abr, shape = Gender, size = `Total Attributable Cost`)) +
+                scale_y_continuous(limits = c(0, max(top_cc_plot_df$`Average Yearly Cost`)), labels = dollar) +
+                scale_x_continuous(labels = comma) +
+                scale_size(labels = dollar) +
+                theme_gdocs() + 
+                theme(axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1)) +
+                xlab("Person Years") +
+                geom_point() + 
+                theme(legend.text=element_text(size=7))
+
+avg_plot <- ggplot(top_cc_plot_df %>% filter(Type == "By Average Yearly Cost"), 
+                   aes(y = `Average Yearly Cost`, 
+                         x = `Number of Person-years`,
+                         #x = reorder(Conditions, -`Average Yearly Cost`) , 
+                         color = Conditions, shape = Gender, size = `Total Attributable Cost`)) +
+                scale_y_continuous(limits = c(0, max(top_cc_plot_df$`Average Yearly Cost`)), labels = dollar) +
+                scale_x_continuous(labels = comma) +
+                scale_size(labels = dollar) +
+                theme_gdocs() + 
+                theme(axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1)) +
+                xlab("Person Years") +
+                geom_point() + 
+                theme(legend.text=element_text(size=7))
+
+library(gridExtra)
+grid::grid.newpage()
+grid::grid.draw(cbind(ggplotGrob(freq_plot), ggplotGrob(avg_plot), size="last"))
+
+plot3 <- plot_grid( freq_plot, avg_plot, ncol=2, align = "v", axis = "t", nrow = 1, labels=c("A", "B"))
+save_plot("plot3.png", plot3, ncol = 2, nrow = 1, base_aspect_ratio = 1, base_height = 8, base_width = 10 )
+
+```
+
+
+```{r}
+pt_n <- tab_1 %>% filter(year == '2014') %>% select(member_no) %>% distinct() %>% summarize(n = n())
+
+tab_1 %>% 
+      filter(year == '2014') %>%
+      select(member_no, contains("col")) %>%
+      gather(column_number, condition, cols[1]:cols[length(cols)]) %>%
+      select(member_no, condition) %>%
+      group_by(condition) %>%
+      summarise(n = n()) %>%
+      mutate(freq = n / pt_n$n)%>%
+      filter(!is.na(condition) & condition != "NULL") %>%
+      arrange(-n) %>%
+      top_n(10) %>%
+      left_join(condition, by = c("condition" = "condition_code" )) 
+```
+
+
+## Patient Transitions
+
+```{r}
+pt_trans <- df_cc %>% 
+            filter(!is.na(age) & sex != 'Not provided') %>%
+            filter(year != 2014) %>% 
+            group_by(year) %>%
+            mutate(top_5_perc = case_when(sum_costs >= quantile(sum_costs, .95) ~ "top 5 percent",
+                                            TRUE ~ "Bottom 95%")) %>%
+            unite("year_cat", c("top_5_perc","year"), sep = " yr:") %>%
+            select(year_cat, member_no, sum_costs, count) %>%
+            spread(year_cat, sum_costs, member_no)
+
+co_mo <- df_cc %>% 
+         filter(!is.na(age) & sex != 'Not provided') %>%
+         filter(year != 2014) %>% 
+          select(member_no, no_comorbidities, year) %>%
+          spread(year, no_comorbidities)
+
+pt_trans %>% 
+  left_join(co_mo, by = "member_no") %>%
+  mutate(co_diff =  `2013` - `2012`) %>%
+  filter(!is.na(`Bottom 95% yr:2012`) & !is.na(`top 5 percent yr:2013`)) %>% 
+  summarise(mean_diff = mean(co_diff), 
+            first_yr_cost = sum(`Bottom 95% yr:2012` ),
+            second_yr_cost = sum(`top 5 percent yr:2013`))
+  #mutate(sum = rowSums(!is.na(.), na.rm = TRUE)) %>%
+  #filter(sum > 3)
+
+pt_trans
+
+
+```
+

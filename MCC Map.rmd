@@ -1,0 +1,255 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+df_cc <- read.csv("C:/Users/DaStophe/Desktop/Data_File_Transfer_Usnish/Data_File_Transfer_Usnish/data/merged_cost_conditions.csv", stringsAsFactors = FALSE)
+```
+
+```{r, message=FALSE}
+library(DescTools)
+
+cols <- max(str_count(df_cc$classes,",")) + 1
+cols <- paste0("col",c(1:cols))
+
+patient_co <- df_cc %>% 
+           mutate(age_group = case_when(age <= 18 ~ '0-18',
+                                        age > 18 & age <= 35 ~ '18-35',
+                                        age > 35 & age <= 50 ~ '35-50',
+                                        age > 50 & age <= 65 ~ '50-65',
+                                        age > 65 ~ '65+',
+                                        TRUE ~ 'Not provided'),
+                  chronic_condition = case_when(no_comorbidities >= 5 ~ "5+ Chronic Condition(s)",
+                                               TRUE ~ paste(as.character(no_comorbidities), 
+                                                                        "Chronic Condition(s)")),
+                  classes = gsub("[[:punct:]]", "", classes) ) %>%
+              #unite("chronic_condition_yr", c("chronic_condition","year"), sep = " yr:") %>%
+              filter(age_group != 'Not provided' & sex != 'Not provided') %>% 
+              mutate(winsorized_sum_cost = Winsorize(sum_costs, probs = c(0, .99))) %>%
+              separate(classes, into = cols, sep = " ", remove = FALSE)
+```
+
+```{r}
+last_year_mbr <- patient_co %>% 
+                    group_by(member_no) %>% 
+                    arrange(-year) %>%
+                    mutate(rn = row_number()) %>% 
+                    select(rn, everything()) %>%
+                    filter(rn == 1)
+
+table(last_year_mbr$sex)
+sd(last_year_mbr$age)
+length((df_cc$member_no))
+```
+
+
+```{r}
+library(rgdal)
+library(tidyverse)
+library(ggthemes)
+library(scales)
+library(arules)
+
+zip <- readOGR(dsn = "C:/Users/DaStophe/Downloads/ZIP_CODE_040114", layer = "ZIP_CODE_040114")
+
+options(scipen = 9999999.99999999999999)
+
+options("scipen"=100, "digits"=4)
+        
+zip@data$id <- rownames(zip@data)
+zip_points <- fortify(zip, region="id")
+
+patient_co_ <- patient_co %>%
+                group_by(zipcode, year) %>%
+                summarise(counts = n()) %>%
+                ungroup() %>%
+                group_by(zipcode) %>%
+                summarise(avg_counts = mean(counts)) %>%
+                filter(avg_counts >= 500) %>%
+                mutate(zipcode = factor(zipcode))
+
+breaks <- round(discretize(patient_co_$avg_counts, breaks = 8, method = "interval", dig.lab = 40, onlycuts = TRUE),0)
+
+zip_df <- left_join(zip_points, zip@data, by="id") %>% 
+          left_join(patient_co_, by = c( "ZIPCODE" = "zipcode")) %>%
+          mutate(patient_co_bin = cut(avg_counts, breaks = breaks, dig.lab = 40, right = FALSE),
+                 patient_co_bin = factor(ifelse(is.na(patient_co_bin), "<= 500 members", paste(patient_co_bin)), 
+                                         levels = c("<= 500 members", levels(patient_co_bin))))
+
+```
+
+## plotting the data frame
+https://timogrossenbacher.ch/2016/12/beautiful-thematic-maps-with-ggplot2-only/
+
+```{r}
+library(viridis)
+
+theme_map <- function(...) {
+  theme_gdocs() +
+  theme(
+    text = element_text(color = "#22211d"),
+    axis.line = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    # panel.grid.minor = element_line(color = "#ebebe5", size = 0.2),
+    panel.grid.major = element_line(color = "#ebebe5", size = 0.2),
+    panel.grid.minor = element_blank(),
+    plot.background = element_rect(fill = "#f5f5f2", color = NA), 
+    panel.background = element_rect(fill = "#f5f5f2", color = NA), 
+    legend.background = element_rect(fill = "#f5f5f2", color = NA),
+    panel.border = element_blank(),
+    ...
+  )
+}
+
+library(readxl)
+library(rgdal)
+
+sinai_facilities <- read_xlsx("C:/Users/DaStophe/Desktop/Data_File_Transfer_Usnish/Data_File_Transfer_Usnish/data/sinai facility.xlsx", col_types = "text") %>% mutate(lat = as.double(lat), lon = as.double(long))
+
+coordinates(sinai_facilities) <- sinai_facilities[,c("lon", "lat")]
+proj4string(sinai_facilities) <- CRS("+init=epsg:4326") # WGS 84
+CRS.new <- CRS("+proj=somerc +lat_0=46.9524056 +lon_0=7.43958333 +ellps=bessel +x_0=2600000 +y_0=1200000 +towgs84=674.374,15.056,405.346 +units=m +k_0=1 +no_defs")
+# (@mdsumner points out that
+#    CRS.new <- CRS("+init=epsg:2056")
+# will work, and indeed it does. See http://spatialreference.org/ref/epsg/2056/proj4/.)
+d.ch1903 <- spTransform(sinai_facilities, CRS.new)
+
+sinai_facilities <- fortify(sinai_facilities, region="facility")
+#http://zevross.com/blog/2014/07/16/mapping-in-r-using-the-ggplot2-package/
+
+map <- ggplot() +  
+      geom_polygon(data = zip_df, mapping = aes(long,lat,group=group, fill=patient_co_bin),
+                   color = "black") +
+  
+      
+      scale_fill_viridis(option = "inferno", direction = 1, discrete = TRUE,  name = "Average Yearly \nMember Count") + 
+      theme_map() +
+      coord_equal() +
+  #geom_point(data = sinai_facilities, aes(x = lat, y = long), color = "black", size = 5) +
+      labs(x = NULL, 
+             y = NULL, 
+             title = "Geographic Distribution of Members", 
+             subtitle = "Average Yearly Member Counts by NYC Zip Code, 2012 - 2014")
+
+map
+```
+
+```{r}
+library(ggthemes)
+
+age.cat <- function(x, lower = 0, upper, by = 5,
+                   sep = "-", above.char = "+") {
+
+ labs <- c(paste(seq(lower, upper - by, by = by),
+                 seq(lower + by - 1, upper - 1, by = by),
+                 sep = sep),
+           paste(upper, above.char, sep = ""))
+
+ cut(floor(x), breaks = c(seq(lower, upper, by = by), Inf),
+     right = FALSE, labels = labs)
+}
+
+
+chart_df <- df_cc %>% 
+            mutate(age = age.cat(age, upper = 85),
+                   zipcode = substr(zipcode, start = 1, stop = 5)) %>% 
+            left_join(zip@data, by = c("zipcode"= "ZIPCODE")) %>%
+            mutate(Borough = case_when(COUNTY == "New York" ~ "Manhattan",
+                                       COUNTY == "Kings" ~ "Brooklyn",
+                                       COUNTY == "Richmond" ~ "Staten Island",
+                                       COUNTY == "Bronx" ~ "Bronx",
+                                       COUNTY == "Queens" ~ "Queens",
+                                       TRUE ~ as.character(NA))) %>%
+            group_by(Borough, age) %>%
+            summarise(perc_1_or_more = sum(if_else(no_comorbidities > 0, 1, 0))/n(),
+                      perc_2_or_more = sum(if_else(no_comorbidities > 1, 1, 0))/n()) %>% filter(!is.na(age) & !is.na(Borough))
+
+library(scales)
+
+perc_plot <- ggplot(chart_df, 
+       aes(x = age, y = perc_2_or_more, group = Borough, color = Borough)) +
+      scale_y_continuous(labels = percent) + 
+      geom_line(size = 1.5) + 
+      theme_gdocs() + 
+      scale_color_viridis(option = "viridis", direction = 1, discrete = TRUE,  name = "Borough") +
+      xlab("Age") +
+      ylab("\n Percentage with >= 1 Chronic Condition") +
+      theme(axis.text.x = element_text(colour = 'black', angle = 90,size = 13, hjust = 0.5, vjust = 0.5))
+```
+
+```{r}
+library(cowplot)
+map_perc <- plot_grid(map, perc_plot, ncol=2, align = "v", nrow = 1, labels=c("A", "B"), rel_heights = c(2, 1))
+save_plot("map perc.png", map_perc, ncol = 2, nrow = 1, base_aspect_ratio = 1.75)
+```
+
+```{r}
+plot_df <- df_cc %>% 
+            mutate(age_group = case_when(age <= 18 ~ '0-18',
+                                                  age > 18 & age <= 35 ~ '18-35',
+                                                  age > 35 & age <= 50 ~ '35-50',
+                                                  age > 50 & age <= 65 ~ '50-65',
+                                                  age > 65 ~ '65+',
+                                                  TRUE ~ 'Not provided')) %>%
+            mutate(zipcode = substr(zipcode, start = 1, stop = 5)) %>% 
+            left_join(zip@data, by = c( "zipcode"= "ZIPCODE"))
+
+ggplot(plot_df, aes(x = age_group, group = COUNTY)) + 
+geom_histogram(aes(y=..density.., stat="count")) + 
+geom_density(aes(fill=COUNTY), colour="black", stat="count")
+```
+
+```{r}
+plot_df
+```
+
+## UHF 42 Mapping
+
+Unfortunately, the zip code to neighborhood crosswalk does not account for nearly 60% of the members in the file and cannot be used.
+
+```{r}
+require(rgdal)
+shape <- readOGR(dsn = "C:/Users/DaStophe/Downloads/uhf42_dohmh_2009/UHF_42_DOHMH_2009", layer = "UHF_42_DOHMH_2009")
+```
+
+```{r}
+library(readxl)
+uhf_42 <- read_xlsx("C:/Users/DaStophe/Desktop/uhf 42 neighborhoods.xlsx")
+
+mismatch_uhf <- data.frame(UHF_NEIGH= c("Pelhem - Throgs Neck", "Downtown - Heights - Slope", 
+                                        "Gramercy Park - Murray Hill", "Port Richmond"),
+              UHFCODE = c("104", "202", "307", "501"), stringsAsFactors = FALSE)
+```
+
+
+```{r}
+library(tidyverse)
+library(magrittr)
+
+uhf_42 %<>% 
+    mutate(`Zip Code` = strsplit(as.character(`Zip Code`), ","),
+           `UHF Neighborhood` = trimws(`UHF Neighborhood`)) %>% 
+    unnest(`Zip Code`) %>%
+    left_join(shape@data %>% select(UHFCODE, UHF_NEIGH), by = c("UHF Neighborhood" = "UHF_NEIGH")) %>% 
+    left_join(mismatch_uhf, c("UHF Neighborhood" = "UHF_NEIGH")) %>%
+    mutate(UHFCODE = if_else(is.na(UHFCODE.x),as.numeric(UHFCODE.y), UHFCODE.x)) %>%
+    select(-UHFCODE.x, -UHFCODE.y)
+```
+
+```{r}
+df_cc %>% 
+  mutate(zipcode = substr(zipcode, start = 1, stop = 5)) %>%
+  left_join(uhf_42, by = c("zipcode"= "Zip Code")) %>%
+  group_by(Borough, `UHF Neighborhood`, UHFCODE) %>%
+  filter(year == 2014) %>%
+  summarise(patient_co = n())
+```
+
+
+

@@ -1,0 +1,76 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+#
+# Regression analysis for comorbidities study
+#
+library(stargazer)
+library(MASS)
+library(arm)
+library(foreign)
+library(plm)
+library(magrittr)
+```
+
+```{r}
+
+##################################################
+# LOAD AND CLEAN DATA
+##################################################
+data <- read.csv('Data_File_Transfer_Usnish/Data_File_Transfer_Usnish/data/regression_data.csv')
+cost_data <- read.csv('Data_File_Transfer_Usnish/Data_File_Transfer_Usnish/data/cost_estimation.csv')
+data <- merge(data, cost_data, by.x=c("member_no", "year"), by.y=c("membno", "year"))
+
+data$zipcode[data$zipcode==''] <- NA
+data$zipcode[data$zipcode=='<NA>'] <- NA
+data$zipcode[data$zipcode=='NA'] <- NA
+data$zipcode <- factor(data$zipcode)
+
+data$sex[data$sex==''] <- NA
+data$sex[data$sex=='<NA>'] <- NA
+data$sex[data$sex=='NA'] <- NA
+data$sex <- factor(data$sex)
+
+data %<>% filter(!is.na(sex)) 
+
+
+# make the number of comorbidities a factor
+no_comorbidities.f <- factor(data$no_comorbidities)
+data <- cbind(no_comorbidities.f, data)
+
+##  make dummy variables factors
+for (column in colnames(data)[c(c(14:83), c(87:131))]) {
+    data[column] <- factor(data[[column]])
+}
+
+# make panel data
+panel_data <- data[data$count>1,]
+```
+
+```{r}
+####################################################
+# CREATE FORMULAS
+####################################################
+formula.base.factor <- as.formula('sum_costs ~ no_comorbidities.f')
+
+###################################################
+# MODELLING
+###################################################
+
+# factor model :: there's a nice plot out of this one
+model.base.factor <- lm(formula.base.factor, data=data)
+```
+
+```{r, results='asis'}
+library(coefplot)
+coef <- model.base.factor$coefficients
+results <- c(round(coef[1],0), round(coef[2:length(coef)] + coef[1],0)) %>% as.data.frame() %>% rownames_to_column()
+results %>% rename("no_comorbid" = "rowname", "results" = ".") %>% 
+  mutate(no_comorbid = gsub( "no_comorbidities.f", "", gsub("\\(Intercept\\)", "0", no_comorbid)),
+         results = results)
+```
+
+

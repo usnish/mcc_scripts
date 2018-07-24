@@ -1,0 +1,49 @@
+---
+title: "Table 1"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+x <- read.csv("C:/Users/DaStophe/Desktop/Data_File_Transfer_Usnish/Data_File_Transfer_Usnish/df_table1.csv")
+df_tab_1 <- read.csv("C:/Users/DaStophe/Desktop/Data_File_Transfer_Usnish/Data_File_Transfer_Usnish/data/merged_cost_conditions.csv")
+```
+
+```{r, results='asis'}
+library(magrittr)
+library(dplyr)
+
+df_tab_1$chronic_condition <- if_else(df_tab_1$no_comorbidities > 1, "2+", "<=1")
+
+df_tab_1 %<>% mutate(age_group = case_when(age <= 18 ~ '0-18',
+                                            age > 18 & age <= 35 ~ '18-35',
+                                            age > 35 & age <= 50 ~ '35-50',
+                                            age > 50 & age <= 65 ~ '50-65',
+                                            age > 65 ~ '65+',
+                                            TRUE ~ 'Not provided'),
+                     chronic_condition = case_when(no_comorbidities <2 ~ "Patients with <= 1 Chronic Condition",
+                                                   no_comorbidities >=2 ~ "Patients with 2 or more Chronic Conditions",
+                                                   TRUE ~ ''))
+#Load package
+library(tableone)
+
+#Create a variable list which we want in Table 1
+listVars <- c("age_group", "sex",  "sum_costs")
+
+#Define categorical variables
+catVars <- c("sex", "age_group")
+
+#Total Population
+table1 <- CreateTableOne(vars = listVars, 
+                         data = df_tab_1 %>% filter(year == 2014), #filtered for last year of care
+                         factorVars = catVars, 
+                         strata = c("chronic_condition"))
+kable(table1)
+```
+
+
+
+
